@@ -20,7 +20,7 @@ type ClientName = String
 --The per-client state 
 
 data Client = Client
-  { clientID       :: TVar (Integer) 
+  { ifAdmin        :: TVar (Bool) 
   , clientName     :: ClientName
   , clientHandle   :: Handle
   -- TVar indicating whether this client has been kicked
@@ -40,12 +40,12 @@ data Message = Notice String --a message from the server
 
 --a way to construct a new instance of Client
 
-newClient :: Integer -> ClientName -> Handle -> STM Client
-newClient n name handle = do
-  id <- newTVar n -- create new box for ID
+newClient :: ClientName -> Handle -> STM Client
+newClient name handle = do
+  adm <- newTVar False -- create new box for admin state
   c <- newTChan -- create new channel 
   k <- newTVar Nothing --create new box for reason
-  return Client { clientID       = id
+  return Client { ifAdmin        = adm
                 , clientName     = name -- name we get from user
                 , clientHandle   = handle --handle we get from user
                 , clientSendChan = c
@@ -87,12 +87,23 @@ tell Server{..} clientik@Client{..} name msg = do
                  sendMessage client msg
                  sendMessage clientik msg
 
--- check clients' ID for kick operation
+-- check password and become or not become admin
+
+checkPasswd :: String -> Client -> STM ()
+checkPasswd password client@Client{..} = do
+        if (password == admPasswd)
+        then do 
+             writeTVar ifAdmin True
+             sendMessage client $ Notice "Valid password! You are a super user during this session"		
+        else sendMessage client $ Notice "Invalid password!"
+        where admPasswd = "Winter is coming"
 				 
-checkID :: Server -> Client -> ClientName -> String -> STM ()
-checkID server@Server{..} client@Client{..} name reason = do
-        id <- readTVar clientID 
-        if (id == 0) 
+-- check admin state for kick operation
+				 
+checkAdmin :: Server -> Client -> ClientName -> String -> STM ()
+checkAdmin server@Server{..} client@Client{..} name reason = do
+        adm <- readTVar ifAdmin 
+        if (adm == True) 
              then kickClient server client name reason
              else sendMessage client $ Notice "Illegal operation! You are not a super user"
 
@@ -127,57 +138,46 @@ main = withSocketsDo $ do
   sock <- listenOn (PortNumber (fromIntegral port))
   printf "Listening on port %d\n" port
   -- enter a loop to accept connections from clients
-  let mainLoop n = do
+  forever $ do
       -- waits for a new client connection
-	  -- returns Handle and some information about client
+      -- returns Handle and some information about client
       (handle, host, port) <- accept sock
       printf "Accepted connection from %s: %s\n" host (show port)
-	  --create a new thread to handle the request
-      --forkFinally let us to ensure that the Handle is always closed 
-	  --in the event of an exception in the server thread	  
-      forkFinally (talk n handle server) (\_ -> hClose handle)
-      mainLoop $! n+1
-   in mainLoop 0
+      --create a new thread to handle the request
+      --forkFinally let us to ensure that the Handle is always closed
+      --in the event of an exception in the server thread
+      forkFinally (talk handle server) (\_ -> hClose handle)
 
 port :: Int
 port = 44444
 
 --The client must choose a name that is not currently in use
 
-checkAddClient :: Integer -> Server -> ClientName -> Handle -> IO (Maybe Client)
-checkAddClient n server@Server{..} name handle = atomically $ do
+checkAddClient :: Server -> ClientName -> Handle -> IO (Maybe Client)
+checkAddClient server@Server{..} name handle = atomically $ do
   --take dictionary of clients from box
   clientmap <- readTVar clients
   --if name is currently in use, client will not be created
   if Map.member name clientmap
     then return Nothing
   --if not - create new client
-    else do client <- newClient n name handle
+    else do client <- newClient name handle
   --renew dictionary of clients and notify all clients about new one
             writeTVar clients $ Map.insert name client clientmap
             broadcast server  $ Notice (name ++ " has connected")
             return (Just client)
-
--- renew ID, if somebody disconnects 
 			
-renewID :: Client -> STM ()
-renewID Client{..} = do
-            id <- readTVar clientID
-            writeTVar clientID $ id - 1
-			
--- handling disconnection of client
+-- handle disconnection of client
 			
 removeClient :: Server -> ClientName -> IO ()
 removeClient server@Server{..} name = atomically $ do
   modifyTVar' clients $ Map.delete name
-  clientmap <- readTVar clients
-  mapM_ (\client -> renewID client) (Map.elems clientmap)
   broadcast server $ Notice (name ++ " has disconnected")
   
 -- create and run new client
   
-talk :: Integer -> Handle -> Server -> IO ()
-talk n handle server@Server{..} = do
+talk :: Handle -> Server -> IO ()
+talk handle server@Server{..} = do
   hSetNewlineMode handle universalNewlineMode
   -- set the buffering mode for the Handle to line buffering
   hSetBuffering handle LineBuffering
@@ -196,7 +196,7 @@ talk n handle server@Server{..} = do
 -- mask asynchronous exceptions to eliminate the possibility
 -- that an exception is received just after checkAddClient but before runClient
       else mask $ \restore -> do
-             ok <- checkAddClient n server name handle --check name
+             ok <- checkAddClient server name handle --check name
              case ok of
                Nothing -> restore $ do --restore them again
 			   --name is in use, choose another one
@@ -301,24 +301,30 @@ handleMessage server client@Client{..} message =
        case words msg of
 	        -- kick somebody
            "/kick" : who : why -> do
-               atomically $ checkID server client who (unwords why)
+               atomically $ checkAdmin server client who (unwords why)
                hPutStrLn clientHandle " "
                return True
-			-- sent private message
+			-- send private message
            "/tell" : who : what -> do
                atomically $ tell server client who $ Tell who clientName (unwords what)
                hPutStrLn clientHandle " "
                return True
+            -- try to become admin
+           "/adminlog" : password -> do
+               atomically $ checkPasswd (unwords password) client
+               hPutStrLn clientHandle " "
+               return True           		
 			-- get information about the possible actions 
            ["/help"] -> do
                hPutStrLn clientHandle " "
-               hPutStrLn clientHandle "/tell name message - Sends message to the user name" 
-               hPutStrLn clientHandle "/kick name reason  - Disconnects user name, specifying the reason, if you are a super user"
-               hPutStrLn clientHandle "/help              - Shows information about the possible actions "
-               hPutStrLn clientHandle "/quit              - Disconnects the current client"
-               hPutStrLn clientHandle "message            - Sends message to all the connected clients."
+               hPutStrLn clientHandle "/tell name message  - Sends message to the user name" 
+               hPutStrLn clientHandle "/kick name reason   - Disconnects user name, specifying the reason, if you are a super user"
+               hPutStrLn clientHandle "/adminlog password  - If password is valid, you will become a super user"
+               hPutStrLn clientHandle "/help               - Shows information about the possible actions "
+               hPutStrLn clientHandle "/quit               - Disconnects the current client"
+               hPutStrLn clientHandle "message             - Sends message to all the connected clients."
                hPutStrLn clientHandle " "
-               return True		   
+               return True   
 			-- exit
            ["/quit"] ->
                return False
@@ -327,7 +333,7 @@ handleMessage server client@Client{..} message =
                atomically $ sendMessage client $ Notice $ "Unrecognised command: " ++ msg
                hPutStrLn clientHandle " "
                return True
-			-- sent message to all clients
+			-- send message to all clients
            _ -> do
                atomically $ broadcast server $ Broadcast clientName msg
                return True
@@ -355,4 +361,4 @@ handleMessage server client@Client{..} message =
                       else do 
                            hPutStrLn clientHandle $ "<" ++ sender ++ ">: " ++ msg
                            hPutStrLn clientHandle " "
-                           return True		 
+                           return True							   
